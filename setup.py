@@ -26,6 +26,7 @@ setup(
         'feature_tracker = module1_camera_verification.feature_tracker:main',
         'imu_logger = module1_camera_verification.imu_logger:main',
         'imu_drift_demo = module1_camera_verification.imu_drift_demo:main',
+        'cam_imu_sync = module1_camera_verification.cam_imu_sync:main',
     	],
 	},
 	)
