@@ -121,14 +121,14 @@ class IMULogger(Node):
         self.get_logger().info("=" * 70 + "\n")
     
     def shutdown(self):
+        self.get_logger().info("✓ Saving IMU data to imu_data_module3.csv")
         self.log_file.close()
-        self.get_logger().info("✓ Saved IMU data to imu_data_module3.csv")
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = IMULogger()
-    
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -136,7 +136,8 @@ def main(args=None):
         node.shutdown()
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
