@@ -24,22 +24,28 @@ class IMULogger(Node):
                          'y': deque(maxlen=1000), 
                          'z': deque(maxlen=1000)}
         
-        # For CSV logging
-        self.log_file = open('imu_data_module3.csv', 'w', newline='')
+        # CSV output (param-controlled so two runs can be labelled separately)
+        self.declare_parameter('output_csv', 'imu_log.csv')
+        csv_path = self.get_parameter('output_csv').get_parameter_value().string_value
+        self.log_file = open(csv_path, 'w', newline='')
         self.csv_writer = csv.writer(self.log_file)
         self.csv_writer.writerow([
-            'timestamp', 
+            'timestamp',
             'accel_x', 'accel_y', 'accel_z',
             'gyro_x', 'gyro_y', 'gyro_z'
         ])
-        
-        # Subscribe to IMU
-        imu_topic = '/world/default/model/x500_skydio_0/link/base_link/sensor/imu_sensor/imu'
-        
+
+        # IMU topic: FCU IMU on X500 base by default;
+        # pass -p imu_topic:=/cam_front/imu to log the OAK-D's onboard IMU instead.
+        self.declare_parameter('imu_topic', '/imu/data')
+        imu_topic = self.get_parameter('imu_topic').get_parameter_value().string_value
+
         self.imu_sub = self.create_subscription(
             Imu, imu_topic,
             self.imu_callback, 10
         )
+
+        self.get_logger().info(f"Logging {imu_topic} -> {csv_path}")
         
         # Statistics timer
         self.create_timer(5.0, self.print_statistics)
@@ -82,24 +88,24 @@ class IMULogger(Node):
         self.get_logger().info(f"IMU STATISTICS (from {self.sample_count} samples)")
         self.get_logger().info("=" * 70)
         
-        # Accelerometer statistics (drone stationary → should read ~9.81 in Z)
+        # Accelerometer statistics. Per-axis means depend on orientation;
+        # use |a| for the gravity check (C-tilt: sim drone rests at ~11.5° pitch).
         self.get_logger().info("\nAccelerometer (m/s²):")
         for axis in ['x', 'y', 'z']:
             data = np.array(self.accel_data[axis])
             mean = np.mean(data)
             std = np.std(data)
-            
             self.get_logger().info(
                 f"  {axis.upper()}: mean={mean:7.4f}, std={std:7.4f}"
             )
-            
-            # Check Z axis (should be ~9.81 when stationary)
-            if axis == 'z':
-                expected_gravity = 9.81
-                error = abs(mean - expected_gravity)
-                self.get_logger().info(
-                    f"       (Expected: {expected_gravity}, Error: {error:.4f})"
-                )
+
+        ax = float(np.mean(self.accel_data['x']))
+        ay = float(np.mean(self.accel_data['y']))
+        az = float(np.mean(self.accel_data['z']))
+        g_measured = float(np.sqrt(ax*ax + ay*ay + az*az))
+        self.get_logger().info(
+            f"  |a| = {g_measured:.4f} m/s²  (expected 9.81, error {abs(g_measured - 9.81):.4f})"
+        )
         
         # Gyroscope statistics (stationary → should be ~0)
         self.get_logger().info("\nGyroscope (rad/s):")
@@ -133,8 +139,8 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         print("\nStopping IMU logger...")
-        node.shutdown()
     finally:
+        node.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

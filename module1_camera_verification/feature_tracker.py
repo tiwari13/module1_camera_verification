@@ -8,197 +8,188 @@ import cv2
 import numpy as np
 from collections import deque
 
+
 class FeatureTracker(Node):
     """
-    Track features between consecutive frames
-    This is the foundation for Visual Odometry
+    Per-camera ORB feature detection + frame-to-frame matching.
+    Phase 1 exit metric: median detection count per stereo camera.
     """
-    
+
     def __init__(self):
         super().__init__('feature_tracker')
-        
+
+        self.declare_parameter('cameras', ['cam_front/left', 'cam_front/right'])
+        self.declare_parameter('show_visualization', False)
+
+        cameras = list(self.get_parameter('cameras').get_parameter_value().string_array_value)
+        self.show_visualization = bool(self.get_parameter('show_visualization').value)
+
         self.bridge = CvBridge()
-        
-        # Use ORB detector (good balance of speed and quality)
         self.detector = cv2.ORB_create(nfeatures=1000)
-        
-        # Brute-force matcher with Hamming distance (for ORB)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        
-        # Previous frame data
-        self.prev_gray = None
-        self.prev_keypoints = None
-        self.prev_descriptors = None
-        self.prev_image = None
-        
-        # Statistics
-        self.match_counts = deque(maxlen=100)
-        self.match_rates = deque(maxlen=100)
-        
-        # Subscribe to front camera
-        base_path = '/world/default/model/x500_skydio_0/model'
-        image_topic = f'{base_path}/camera_front/link/camera_link/sensor/IMX214/image'
-        
-        self.image_sub = self.create_subscription(
-            Image, image_topic,
-            self.track_features, 10
-        )
-        
-        # For visualization
-        self.show_visualization = True
-        
-        self.get_logger().info("Feature tracker ready!")
-        self.get_logger().info("Tracking features between frames...")
-        self.get_logger().info("Press Ctrl+C to stop and see statistics")
-    
-    def track_features(self, msg):
-        # Convert to grayscale
-        cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        
-        # Detect features in current frame
-        keypoints, descriptors = self.detector.detectAndCompute(gray, None)
-        
-        if descriptors is None or len(keypoints) < 10:
-            self.get_logger().warn(f"Only {len(keypoints)} features detected - too few!")
+
+        # Per-camera state and rolling stats.
+        self.state = {
+            cam: {
+                'prev_gray': None,
+                'prev_kp': None,
+                'prev_desc': None,
+                'prev_img': None,
+                'detect_counts': deque(maxlen=100),
+                'match_counts': deque(maxlen=100),
+                'match_rates': deque(maxlen=100),
+            }
+            for cam in cameras
+        }
+
+        for cam in cameras:
+            topic = f'/{cam}/image_raw'
+            # c=cam binds the loop variable into the lambda's default arg.
+            self.create_subscription(
+                Image, topic,
+                lambda msg, c=cam: self.track_features(msg, c),
+                10,
+            )
+            self.get_logger().info(f"Subscribed to {topic}")
+
+        self.create_timer(10.0, self.print_periodic_stats)
+
+        self.get_logger().info("Feature tracker ready — Ctrl+C for final stats.")
+
+    def decode_gray(self, msg):
+        if msg.encoding in ('mono8', '8UC1'):
+            return self.bridge.imgmsg_to_cv2(msg, 'mono8')
+        bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    def track_features(self, msg, cam):
+        s = self.state[cam]
+
+        gray = self.decode_gray(msg)
+        kp, desc = self.detector.detectAndCompute(gray, None)
+
+        if desc is None or len(kp) < 10:
+            self.get_logger().warn(f"[{cam}] only {len(kp)} features detected")
             return
-        
-        # If we have a previous frame, match features
-        if self.prev_descriptors is not None and len(self.prev_descriptors) > 0:
+
+        s['detect_counts'].append(len(kp))
+
+        if s['prev_desc'] is not None and len(s['prev_desc']) > 0:
             try:
-                # Match descriptors
-                matches = self.matcher.match(descriptors, self.prev_descriptors)
-                
-                # Sort by distance (best matches first)
-                matches = sorted(matches, key=lambda x: x.distance)
-                
-                # Filter good matches (distance < threshold)
-                good_matches = [m for m in matches if m.distance < 50]
-                
-                # Calculate statistics
-                match_count = len(good_matches)
-                match_rate = (match_count / len(keypoints)) * 100
-                
-                self.match_counts.append(match_count)
-                self.match_rates.append(match_rate)
-                
-                # Log results
-                status = "✓ GOOD" if match_count > 100 else "⚠ LOW" if match_count > 50 else "✗ POOR"
-                
+                matches = self.matcher.match(desc, s['prev_desc'])
+                matches = sorted(matches, key=lambda m: m.distance)
+                good = [m for m in matches if m.distance < 50]
+
+                match_count = len(good)
+                match_rate = (match_count / len(kp)) * 100.0
+                s['match_counts'].append(match_count)
+                s['match_rates'].append(match_rate)
+
+                status = "GOOD" if match_count > 100 else "LOW" if match_count > 50 else "POOR"
                 self.get_logger().info(
-                    f"Detected: {len(keypoints):4d} | "
-                    f"Matched: {match_count:4d} ({match_rate:5.1f}%) | "
-                    f"Status: {status}"
+                    f"[{cam}] detect={len(kp):4d} match={match_count:4d} "
+                    f"({match_rate:5.1f}%) {status}"
                 )
-                
-                # Visualize if enabled
-                if self.show_visualization and len(good_matches) > 0:
-                    self.visualize_matches(
-                        cv_image, gray,
-                        keypoints, self.prev_keypoints,
-                        good_matches
-                    )
-                
-                # Quality warnings
-                if match_count < 50:
-                    self.get_logger().warn(
-                        "⚠ LOW TRACKING: < 50 matches (VIO will struggle!)"
-                    )
-                    self.get_logger().warn(
-                        "  Try: Slow down drone motion or improve lighting"
-                    )
-                
+
+                if self.show_visualization and good:
+                    self.visualize_matches(cam, msg, gray, kp, s, good)
+
             except cv2.error as e:
-                self.get_logger().error(f"Matching error: {e}")
-        
-        # Store current frame for next iteration
-        self.prev_gray = gray
-        self.prev_image = cv_image
-        self.prev_keypoints = keypoints
-        self.prev_descriptors = descriptors
-    
-    def visualize_matches(self, current_img, current_gray, 
-                         current_kp, prev_kp, matches):
-        """Draw feature matches between frames"""
-        
-        if self.prev_gray is None or self.prev_image is None:
+                self.get_logger().error(f"[{cam}] matching error: {e}")
+
+        s['prev_gray'] = gray
+        s['prev_img'] = self.bridge.imgmsg_to_cv2(msg, 'bgr8') if msg.encoding not in ('mono8', '8UC1') else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        s['prev_kp'] = kp
+        s['prev_desc'] = desc
+
+    def visualize_matches(self, cam, msg, gray, kp, s, matches):
+        cur_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        if s['prev_img'] is None:
             return
-        
-        # Draw matches (show top 50 for clarity)
+
         match_img = cv2.drawMatches(
-            self.prev_image, prev_kp,
-            current_img, current_kp,
-            matches[:50],  # Top 50 matches
+            s['prev_img'], s['prev_kp'],
+            cur_img, kp,
+            matches[:50],
             None,
             matchColor=(0, 255, 0),
             singlePointColor=(255, 0, 0),
-            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
         )
-        
-        # Add info overlay
-        info_text = f"Matches: {len(matches)}"
-        cv2.putText(match_img, info_text,
-                   (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                   1.2, (0, 255, 0), 2)
-        
-        # Show
-        cv2.imshow('Feature Tracking', match_img)
+        cv2.putText(
+            match_img, f"{cam}  matches={len(matches)}",
+            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
+        )
+        cv2.imshow(f'Feature Tracking — {cam}', match_img)
         cv2.waitKey(1)
-    
+
+    def print_periodic_stats(self):
+        for cam, s in self.state.items():
+            if not s['detect_counts']:
+                continue
+            d_med = float(np.median(s['detect_counts']))
+            m_med = float(np.median(s['match_counts'])) if s['match_counts'] else 0.0
+            r_med = float(np.median(s['match_rates'])) if s['match_rates'] else 0.0
+            self.get_logger().info(
+                f"[{cam:<16}] detect_med={d_med:6.1f}  match_med={m_med:6.1f}  "
+                f"({r_med:5.1f}%)  frames={len(s['detect_counts'])}"
+            )
+
     def print_statistics(self):
-        """Print final statistics"""
-        if len(self.match_counts) == 0:
+        any_data = any(s['detect_counts'] for s in self.state.values())
+        if not any_data:
             self.get_logger().warn("No tracking data collected")
             return
-        
-        avg_matches = np.mean(self.match_counts)
-        std_matches = np.std(self.match_counts)
-        min_matches = np.min(self.match_counts)
-        max_matches = np.max(self.match_counts)
-        avg_rate = np.mean(self.match_rates)
-        
+
         print("\n" + "=" * 70)
-        print("FEATURE TRACKING STATISTICS")
+        print("FEATURE TRACKING — PHASE 1 EXIT METRIC (per camera)")
         print("=" * 70)
-        print(f"Frames processed: {len(self.match_counts)}")
-        print(f"\nMatches per frame:")
-        print(f"  Average: {avg_matches:.1f} ± {std_matches:.1f}")
-        print(f"  Range: {min_matches:.0f} to {max_matches:.0f}")
-        print(f"  Match rate: {avg_rate:.1f}%")
-        print("\nVIO Quality Assessment:")
-        
-        if avg_matches > 150:
-            print("  ★★★ EXCELLENT: Perfect for VIO!")
-            print("  Your camera motion and environment are ideal.")
-        elif avg_matches > 100:
-            print("  ★★☆ GOOD: Should work well for VIO")
-            print("  Sufficient features for reliable tracking.")
-        elif avg_matches > 50:
-            print("  ★☆☆ ACCEPTABLE: May work for VIO")
-            print("  Consider slowing drone motion or improving lighting.")
-        else:
-            print("  ☆☆☆ POOR: Not enough for reliable VIO")
-            print("  Issues:")
-            print("    - Camera motion too fast?")
-            print("    - Textureless environment?")
-            print("    - Poor lighting?")
-        
+
+        for cam, s in self.state.items():
+            if not s['detect_counts']:
+                print(f"\n=== {cam} ===  (no frames)")
+                continue
+
+            d = np.array(s['detect_counts'])
+            print(f"\n=== {cam} ===")
+            print(f"Frames: {len(d)}")
+            print(f"Detections: median={np.median(d):.1f}, mean={np.mean(d):.1f} "
+                  f"± {np.std(d):.1f}, range {np.min(d):.0f}–{np.max(d):.0f}")
+
+            if s['match_counts']:
+                m = np.array(s['match_counts'])
+                r = np.array(s['match_rates'])
+                print(f"Matches:    median={np.median(m):.1f}, mean={np.mean(m):.1f} "
+                      f"± {np.std(m):.1f}, match rate {np.mean(r):.1f}%")
+                avg_m = float(np.mean(m))
+                if avg_m > 150:
+                    rating = "EXCELLENT — strong VIO prospect"
+                elif avg_m > 100:
+                    rating = "GOOD — sufficient for VIO"
+                elif avg_m > 50:
+                    rating = "ACCEPTABLE — VIO marginal"
+                else:
+                    rating = "POOR — VIO will struggle"
+                print(f"VIO quality: {rating}")
+            else:
+                print("Matches:    (only one frame received)")
+
         print("=" * 70 + "\n")
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = FeatureTracker()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         print("\nStopping feature tracker...")
+    finally:
         node.print_statistics()
         cv2.destroyAllWindows()
-    finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
